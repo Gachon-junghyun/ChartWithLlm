@@ -17,16 +17,15 @@ echo ""
 # ── 사전 확인 ─────────────────────────────────────────────────
 
 # 1. text_chart.py 위치 확인
-TC_PATH="../NEW_INDICATOR/text_chart.py"
+TC_PATH="$SCRIPT_DIR/text_chart.py"
 if [ ! -f "$TC_PATH" ]; then
     echo "❌ text_chart.py 없음: $TC_PATH"
-    echo "   CLAUDE_CHART_LLM 폴더가 NEW_INDICATOR 와 같은 위치에 있는지 확인하세요."
     exit 1
 fi
 echo "✓ text_chart.py 확인"
 
 # 2. KOSPI 200 xlsx 확인
-XLSX="../NEW_INDICATOR/kospi_screener/kospi200.xlsx"
+XLSX="$SCRIPT_DIR/data/kospi200.xlsx"
 if [ ! -f "$XLSX" ]; then
     echo "❌ kospi200.xlsx 없음: $XLSX"
     exit 1

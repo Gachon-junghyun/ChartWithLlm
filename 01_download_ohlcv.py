@@ -72,6 +72,8 @@ def download_one(ticker_info: dict) -> tuple[str, bool, str]:
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
         raw.columns = raw.columns.str.lower()
+        # 중복 컬럼 제거 (yfinance 복수 종목 반환 대응)
+        raw = raw.loc[:, ~raw.columns.duplicated(keep="first")]
 
         if len(raw) < 20:
             return code, False, f"{name} — 데이터 부족 ({len(raw)}행)"

@@ -162,6 +162,8 @@ def process_ticker(code: str, name: str) -> list[dict]:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = df.columns.str.lower()
+    # 중복 컬럼 제거 (yfinance가 복수 종목 데이터를 섞어서 반환하는 경우 대응)
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
     df = df.dropna(subset=["open", "high", "low", "close"])
     df = df.sort_index()
 
