@@ -52,7 +52,7 @@ CLAUDE_CHART_LLM/
 ### 1단계. 패키지 설치
 
 ```bash
-pip install yfinance openpyxl requests --break-system-packages
+pip install yfinance openpyxl google-genai --break-system-packages
 ```
 
 ### 2단계. OHLCV 다운로드 (약 10~20분)
@@ -73,14 +73,10 @@ python3 02_generate_xy.py
 - 예상 출력: **200종목 × 약 25~30 윈도우 ≈ 5,000~6,000개 페어**
 - `xy_pairs/pairs.jsonl` 에 저장
 
-### 4단계. Ollama 실행 확인
+### 4단계. Gemini API 키 설정
 
 ```bash
-# 모델 다운로드 (최초 1회)
-ollama pull gemma3:27b
-
-# 서버 실행 (별도 터미널)
-ollama serve
+export GEMINI_API_KEY=your_key_here
 ```
 
 ### 5단계. LLM 2-pass 추론 (가장 오래 걸림)

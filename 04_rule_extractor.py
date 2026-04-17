@@ -22,13 +22,15 @@
 """
 
 import json
+import os
 import sys
 import logging
 from pathlib import Path
 from itertools import combinations
 from collections import defaultdict
 
-import requests
+from google import genai
+from google.genai import types
 
 # ── 경로 ──────────────────────────────────────────────────────────────────────
 BASE_DIR      = Path(__file__).parent
@@ -37,10 +39,23 @@ RULES_DIR     = BASE_DIR / "rules"
 RULES_DIR.mkdir(exist_ok=True)
 KB_PATH       = RULES_DIR / "knowledge_base.md"
 
-# ── Ollama 설정 ────────────────────────────────────────────────────────────────
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL      = "gemma3:27b"
-TIMEOUT    = 120
+# ── Gemini 설정 ────────────────────────────────────────────────────────────────
+MODEL = "gemini-2.5-flash"
+
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "API 키 없음. 환경변수 GEMINI_API_KEY 를 설정하세요.\n"
+                "  export GEMINI_API_KEY=your_key_here"
+            )
+        _client = genai.Client(api_key=api_key)
+    return _client
 
 # 패턴 그룹당 최대 모순 쌍 수 (너무 많으면 처리 오래 걸림)
 MAX_CONFLICT_PAIRS = 5
@@ -137,16 +152,36 @@ def format_case(sample: dict, label: str) -> str:
 테스트 가능 룰: {testable}"""
 
 
-def call_ollama(messages: list[dict]) -> str:
-    payload = {
-        "model":   MODEL,
-        "messages": messages,
-        "stream":  False,
-        "options": {"temperature": 0.2},
-    }
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"].strip()
+def call_gemini(messages: list[dict], temperature: float = 0.2) -> str:
+    """Google GenAI chat API 호출 → 응답 텍스트 반환"""
+    client = _get_client()
+
+    system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+
+    contents = []
+    for m in messages:
+        if m["role"] == "user":
+            contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(text=m["content"])])
+            )
+        elif m["role"] == "assistant":
+            contents.append(
+                types.Content(role="model", parts=[types.Part.from_text(text=m["content"])])
+            )
+
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        top_p=0.9,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        **({"system_instruction": system_msg} if system_msg else {}),
+    )
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=contents,
+        config=config,
+    )
+    return response.text.strip()
 
 
 RULE_SYSTEM = """당신은 주식 차트 패턴 분석 룰을 도출하는 전문가입니다.
@@ -199,7 +234,7 @@ ELSE IF [조건3] THEN [반대방향]
         {"role": "system", "content": RULE_SYSTEM},
         {"role": "user",   "content": prompt},
     ]
-    return call_ollama(messages)
+    return call_gemini(messages)
 
 
 def synthesize_pattern_rules(pattern: str, all_rules: list[str]) -> str:
@@ -230,7 +265,7 @@ def synthesize_pattern_rules(pattern: str, all_rules: list[str]) -> str:
         {"role": "system", "content": RULE_SYSTEM},
         {"role": "user",   "content": prompt},
     ]
-    return call_ollama(messages)
+    return call_gemini(messages)
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────

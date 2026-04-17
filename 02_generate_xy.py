@@ -50,20 +50,30 @@ import numpy as np
 import pandas as pd
 
 # ── 경로 ──────────────────────────────────────────────────────────────────────
-BASE_DIR  = Path(__file__).parent
-CACHE_DIR = BASE_DIR / "ohlcv_cache"
-OUT_DIR   = BASE_DIR / "xy_pairs"
+BASE_DIR   = Path(__file__).parent
+CACHE_DIR  = BASE_DIR / "ohlcv_cache"
+OUT_DIR    = BASE_DIR / "xy_pairs"
+CHART_DIR  = BASE_DIR / "chart_save"
 OUT_DIR.mkdir(exist_ok=True)
+CHART_DIR.mkdir(exist_ok=True)
 
 # text_chart.py 는 같은 폴더에 포함됨
 sys.path.insert(0, str(BASE_DIR))
-from text_chart import plot_text_chart, add_ma, add_bollinger, generate_metadata
+from text_chart import plot_combined_chart
 
 # ── 윈도우 설정 ───────────────────────────────────────────────────────────────
-X_DAYS    = 126   # 6개월 ≈ 126 거래일
+X_DAYS    = 42    # 2개월 ≈ 42 거래일
 Y_DAYS    = 10    # 미래 10 거래일
-SHIFT     = 21    # 1개월 ≈ 21 거래일씩 shift
+SHIFT     = 10    # 약 2주씩 shift (2개월 창에서 더 촘촘하게)
 FLAT_THR  = 2.0   # ±2% 미만이면 FLAT
+
+# ── 서브차트 설정 ─────────────────────────────────────────────────────────────
+CHART_ROWS  = 20   # 가격 차트 높이
+VOL_ROWS    = 4    # 거래량 바 높이
+RSI_ROWS    = 15   # RSI 서브차트 높이
+RSI_WINDOW  = 14   # RSI 계산 기간
+OBV_ROWS    = 10   # OBV 서브차트 높이
+OBV_WINDOW  = 20   # Rolling OBV 집계 기간 (일)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,19 +143,27 @@ def compute_y_stats(y_df: pd.DataFrame) -> dict:
     }
 
 
-def make_x_chart(x_df: pd.DataFrame) -> tuple[str, str]:
-    """X 구간 텍스트 차트 + 메타데이터 반환"""
-    indicators = {**add_ma(x_df, [20, 60]), **add_bollinger(x_df)}
-    chart = plot_text_chart(
+def make_x_chart(x_df: pd.DataFrame, code: str = "", name: str = "",
+                 x_start: str = "", x_end: str = "") -> str:
+    """X 구간 통합 ASCII 차트 (가격 + 거래량 + RSI + OBV) 반환 + JSON 저장"""
+    save_path = None
+    save_meta = None
+    if code and x_end:
+        save_path = str(CHART_DIR / f"{code}_{x_end}.json")
+        save_meta = {"ticker": code, "name": name, "x_start": x_start, "x_end": x_end}
+
+    return plot_combined_chart(
         x_df,
-        rows=25,
+        rows=CHART_ROWS,
         cols=X_DAYS,
-        vol_rows=5,
-        indicators=indicators,
-        show_meta=False,
+        vol_rows=VOL_ROWS,
+        rsi_rows=RSI_ROWS,
+        rsi_window=RSI_WINDOW,
+        obv_rows=OBV_ROWS,
+        obv_window=OBV_WINDOW,
+        save_path=save_path,
+        save_meta=save_meta,
     )
-    meta = generate_metadata(x_df)
-    return chart, meta
 
 
 def process_ticker(code: str, name: str) -> list[dict]:
@@ -196,7 +214,8 @@ def process_ticker(code: str, name: str) -> list[dict]:
         sample_id = f"{code}_{x_end_str}"
 
         try:
-            chart, meta = make_x_chart(x_df)
+            chart   = make_x_chart(x_df, code=code, name=name,
+                                   x_start=x_start_str, x_end=x_end_str)
             y_stats = compute_y_stats(y_df)
         except Exception as e:
             log.warning(f"{code} 윈도우 {x_end_str}: 오류 — {e}")
@@ -204,15 +223,14 @@ def process_ticker(code: str, name: str) -> list[dict]:
             continue
 
         pair = {
-            "id":       sample_id,
-            "ticker":   code,
-            "name":     name,
-            "x_start":  x_start_str,
-            "x_end":    x_end_str,
-            "y_start":  y_start_str,
-            "y_end":    y_end_str,
-            "x_chart":  chart,
-            "x_meta":   meta,
+            "id":      sample_id,
+            "ticker":  code,
+            "name":    name,
+            "x_start": x_start_str,
+            "x_end":   x_end_str,
+            "y_start": y_start_str,
+            "y_end":   y_end_str,
+            "x_chart": chart,
             **y_stats,
         }
         pairs.append(pair)

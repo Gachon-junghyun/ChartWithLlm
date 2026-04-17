@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -55,7 +56,7 @@ from typing import Dict, List, Optional, Tuple
 #  문자 상수
 # ══════════════════════════════════════════════════════════════════════════════
 
-EMPTY     = "0"   # 빈칸
+EMPTY     = " "   # 빈칸
 WICK      = "│"   # 꼬리 (고가/저가)
 BULL_BODY = "█"   # 양봉 몸통
 BEAR_BODY = "░"   # 음봉 몸통
@@ -68,6 +69,25 @@ DEFAULT_IND_CHARS = [".", "-", "+", "~", "*", "="]
 
 # 캔들 문자는 지표보다 항상 우선 (오버레이 금지)
 _CANDLE_CHARS = {WICK, BULL_BODY, BEAR_BODY, DOJI_BODY}
+
+# RSI/OBV 서브차트 문자
+RSI_DOT   = "*"   # RSI 점 (중립, 30~70)
+RSI_OB    = "+"   # RSI > 70 (과매수) — 가격차트 ^ (BB상단) 과 구분
+RSI_OS    = "="   # RSI < 30 (과매도) — 가격차트 v (BB하단) 과 구분
+RSI_REF   = "─"   # 30/70 기준선
+RSI_MID   = ":"   # 50 중간선 — 가격차트 · (BB중단) 과 구분
+OBV_BULL  = "█"   # OBV 양봉 (매수압력)
+OBV_BEAR  = "░"   # OBV 음봉 (매도압력)
+OBV_ZERO  = "─"   # OBV 중립선
+
+# 통합 차트용 고정 지표 문자 (순서 고정으로 LLM 혼선 방지)
+_COMBINED_IND_CHARS = {
+    "MA20":     ".",
+    "MA60":     "-",
+    "BB_upper": "^",
+    "BB_mid":   "·",
+    "BB_lower": "v",
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -585,6 +605,301 @@ def make_training_samples(
             })
 
     return samples
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  RSI / OBV 서브차트 내부 렌더러
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compute_rsi_arr(close: pd.Series, window: int = 14) -> np.ndarray:
+    """pandas 기반 RSI 계산 → numpy array 반환"""
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(window).mean()
+    loss  = (-delta.clip(upper=0)).rolling(window).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).values
+
+
+def _render_rsi_subplot(
+    df: pd.DataFrame,
+    lw: int,
+    n: int,
+    rows: int = 7,
+    window: int = 14,
+) -> list[str]:
+    """
+    RSI 서브차트를 문자열 라인 목록으로 반환.
+    lw: 가격 차트와 동일한 레이블 폭 (정렬용).
+    n : 표시할 캔들 수 (이미 슬라이싱된 df 기준).
+
+    문자 체계:
+      *  RSI 점 (중립, 30~70)
+      ^  RSI > 70 (과매수)
+      v  RSI < 30 (과매도)
+      ─  30 / 70 기준선
+      ·  50 중간선
+    """
+    _df   = _norm(df)
+    close = _df["close"].astype(float)
+    rsi   = _compute_rsi_arr(close, window)
+
+    grid = [[EMPTY] * n for _ in range(rows)]
+
+    ob_row  = _price_to_row(70.0, 0.0, 100.0, rows)
+    os_row  = _price_to_row(30.0, 0.0, 100.0, rows)
+    mid_row = _price_to_row(50.0, 0.0, 100.0, rows)
+
+    # RSI 점 렌더링
+    for ci in range(n):
+        val = rsi[ci]
+        if np.isnan(val):
+            continue
+        ri = _price_to_row(float(val), 0.0, 100.0, rows)
+        ch = RSI_OB if val >= 70 else (RSI_OS if val <= 30 else RSI_DOT)
+        grid[ri][ci] = ch
+
+    # 기준선 채우기 (RSI 점 없는 셀만)
+    for ref_row, ref_ch in [(ob_row, RSI_REF), (mid_row, RSI_MID), (os_row, RSI_REF)]:
+        for ci in range(n):
+            if grid[ref_row][ci] == EMPTY:
+                grid[ref_row][ci] = ref_ch
+
+    # 레이블 맵
+    label_map: dict[int, str] = {}
+    for row_idx, lbl in [(0, "100"), (ob_row, " 70"), (mid_row, " 50"),
+                          (os_row, " 30"), (rows - 1, "  0")]:
+        label_map[row_idx] = lbl
+
+    sep = " " * lw + "-+" + "-" * n
+    header = "RSI".rjust(lw) + f"({window})" + " " * max(0, n - len(f"({window})")) + ""
+
+    lines: list[str] = [sep]
+    # 헤더 행: 레이블 영역에 "RSI" 표시
+    lines.append("RSI".rjust(lw) + " |" + " " * n)
+    for ri in range(rows):
+        row_str = "".join(grid[ri])
+        lbl     = label_map.get(ri, "").rjust(lw)
+        lines.append(f"{lbl} |{row_str}")
+
+    return lines
+
+
+def _render_obv_subplot(
+    df: pd.DataFrame,
+    lw: int,
+    n: int,
+    rows: int = 6,
+    window: int = 20,
+) -> list[str]:
+    """
+    Rolling OBV 서브차트를 문자열 라인 목록으로 반환.
+
+    Rolling OBV 정의:
+      signed_vol[i] = sign(close[i] - close[i-1]) × volume[i]
+      obv_roll[i]   = Σ signed_vol[i-window+1 … i]
+    → 일정 기간 내 매수/매도 압력 누적치. 전체 OBV가 아닌 국소 모멘텀 표시.
+
+    문자 체계:
+      █  양봉 바 (OBV > 0 구간)
+      ░  음봉 바 (OBV < 0 구간)
+      ─  중립선 (OBV ≈ 0)
+    """
+    _df = _norm(df)
+    if "volume" not in _df.columns:
+        return []
+
+    close = _df["close"].astype(float)
+    vol   = _df["volume"].astype(float)
+
+    signed_vol = np.sign(close.diff().fillna(0)) * vol
+    obv_roll   = pd.Series(signed_vol).rolling(window, min_periods=1).sum().values
+
+    obv_min = float(np.nanmin(obv_roll))
+    obv_max = float(np.nanmax(obv_roll))
+
+    if obv_max == obv_min:
+        return []
+
+    # 0을 항상 범위에 포함
+    scale_min = min(obv_min, 0.0)
+    scale_max = max(obv_max, 0.0)
+
+    zero_row = _price_to_row(0.0, scale_min, scale_max, rows)
+    grid = [[EMPTY] * n for _ in range(rows)]
+
+    for ci in range(n):
+        val = obv_roll[ci]
+        if np.isnan(val):
+            continue
+        val_row = _price_to_row(float(val), scale_min, scale_max, rows)
+        ch      = OBV_BULL if val >= 0 else OBV_BEAR
+        r_top   = min(zero_row, val_row)
+        r_bot   = max(zero_row, val_row)
+        for r in range(r_top, r_bot + 1):
+            grid[r][ci] = ch
+
+    # 중립선
+    for ci in range(n):
+        if grid[zero_row][ci] == EMPTY:
+            grid[zero_row][ci] = OBV_ZERO
+
+    sep  = " " * lw + "-+" + "-" * n
+    lines: list[str] = [sep]
+    lines.append(f"OBV{window}d".rjust(lw) + " |" + " " * n)
+    for ri in range(rows):
+        row_str = "".join(grid[ri])
+        lines.append(" " * lw + " |" + row_str)
+
+    return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  통합 ASCII 차트 (가격 + 거래량 + RSI + OBV)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_combined_chart(
+    df: pd.DataFrame,
+    rows: int = 20,
+    cols: Optional[int] = None,
+    vol_rows: int = 4,
+    rsi_rows: int = 15,
+    rsi_window: int = 14,
+    obv_rows: int = 10,
+    obv_window: int = 20,
+    save_path: Optional[str] = None,
+    save_meta: Optional[Dict] = None,
+) -> str:
+    """
+    가격 캔들 + 거래량 + RSI + Rolling OBV 를 하나의 ASCII 차트로 반환.
+
+    Parameters
+    ----------
+    df          : OHLCV DataFrame (컬럼 대소문자 무관)
+    rows        : 가격 차트 높이
+    cols        : 표시할 최근 캔들 수 (None = 전체)
+    vol_rows    : 거래량 차트 높이
+    rsi_rows    : RSI 서브차트 높이
+    rsi_window  : RSI 계산 기간 (기본 14)
+    obv_rows    : OBV 서브차트 높이
+    obv_window  : Rolling OBV 누적 기간 (기본 20)
+
+    차트 구조
+    ---------
+        가격 레이블 | 캔들 그리드 (MA20/MA60/볼린저 오버레이)
+        ───────────+──────────────────────────────────────────
+        거래량 레이블 | 볼륨 바
+        ───────────+──────────────────────────────────────────
+        RSI(14)   | RSI 라인 (* ^ v 문자)
+        ───────────+──────────────────────────────────────────
+        OBV{W}d   | Rolling OBV 바 (█ ░)
+        [범례]
+    """
+    _df = _norm(df)
+    if cols is not None:
+        _df = _df.iloc[-cols:].reset_index(drop=True)
+
+    n = len(_df)
+    if n == 0:
+        raise ValueError("DataFrame이 비어 있습니다.")
+
+    o_arr = _df["open"].values.astype(float)
+    h_arr = _df["high"].values.astype(float)
+    l_arr = _df["low"].values.astype(float)
+    c_arr = _df["close"].values.astype(float)
+
+    min_p = float(l_arr.min())
+    max_p = float(h_arr.max())
+
+    # ── 1. 가격 그리드 ──────────────────────────────────────────────────────
+    grid: list[list[str]] = [[EMPTY] * n for _ in range(rows)]
+    for ci in range(n):
+        col = [EMPTY] * rows
+        _render_candle(col, o_arr[ci], h_arr[ci], l_arr[ci], c_arr[ci],
+                       min_p, max_p, rows)
+        for r in range(rows):
+            grid[r][ci] = col[r]
+
+    # ── 2. 지표 오버레이 (MA20/MA60/볼린저) ─────────────────────────────────
+    indicators = {**add_ma(_df, [20, 60]), **add_bollinger(_df)}
+    for name, series in indicators.items():
+        ch  = _COMBINED_IND_CHARS.get(name, ".")
+        arr = series.values.astype(float)
+        for ci in range(min(n, len(arr))):
+            v = arr[ci]
+            if np.isnan(v):
+                continue
+            ri = _price_to_row(v, min_p, max_p, rows)
+            if grid[ri][ci] not in _CANDLE_CHARS:
+                grid[ri][ci] = ch
+
+    # ── 3. 가격 축 레이블 폭 계산 ────────────────────────────────────────────
+    label_row_set = {0, rows // 4, rows // 2, 3 * rows // 4, rows - 1}
+    label_prices  = {r: _row_to_price(r, min_p, max_p, rows) for r in label_row_set}
+    lw = max(len(_fmt_price(p)) for p in label_prices.values())
+
+    # ── 4. 가격 차트 렌더링 ───────────────────────────────────────────────────
+    lines: list[str] = []
+    for ri in range(rows):
+        row_str = "".join(grid[ri])
+        lbl = (_fmt_price(label_prices[ri]).rjust(lw)
+               if ri in label_row_set else " " * lw)
+        lines.append(f"{lbl} |{row_str}")
+
+    lines.append(" " * lw + "-+" + "-" * n)
+
+    # ── 5. 거래량 바 ─────────────────────────────────────────────────────────
+    if vol_rows > 0 and "volume" in _df.columns:
+        v_arr  = _df["volume"].values.astype(float)
+        max_v  = v_arr.max()
+        vgrid  = [[" "] * n for _ in range(vol_rows)]
+        for ci in range(n):
+            if v_arr[ci] <= 0 or max_v == 0:
+                continue
+            bar  = max(1, round(v_arr[ci] / max_v * vol_rows))
+            v_ch = VOL_BULL if c_arr[ci] >= o_arr[ci] else VOL_BEAR
+            for r in range(vol_rows - bar, vol_rows):
+                vgrid[r][ci] = v_ch
+        vol_lbl = _fmt_vol(max_v)
+        for ri, vrow in enumerate(vgrid):
+            lbl = vol_lbl.rjust(lw) if ri == 0 else " " * lw
+            lines.append(f"{lbl} |{''.join(vrow)}")
+
+    # ── 6. RSI 서브차트 ───────────────────────────────────────────────────────
+    if rsi_rows > 0:
+        lines.extend(_render_rsi_subplot(_df, lw, n, rsi_rows, rsi_window))
+
+    # ── 7. Rolling OBV 서브차트 ──────────────────────────────────────────────
+    if obv_rows > 0:
+        lines.extend(_render_obv_subplot(_df, lw, n, obv_rows, obv_window))
+
+    # ── 8. 범례 ───────────────────────────────────────────────────────────────
+    lines.append("")
+    lines.append(f"  캔들: {BULL_BODY}=양봉  {BEAR_BODY}=음봉  {DOJI_BODY}=도지  {WICK}=꼬리")
+    lines.append("  지표: [.]MA20  [-]MA60  [^]BB상단  [·]BB중단  [v]BB하단")
+    lines.append(f"  RSI:  [{RSI_DOT}]중립  [{RSI_OB}]과매수(>70)  [{RSI_OS}]과매도(<30)  [─]30/70선  [:]50선")
+    lines.append(f"  OBV:  [{OBV_BULL}]매수압력  [{OBV_BEAR}]매도압력  [─]중립선  ({obv_window}일 롤링)")
+
+    chart_str = "\n".join(lines)
+
+    # ── JSON 저장 ─────────────────────────────────────────────────────────────
+    if save_path is not None:
+        import json, datetime
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "chart": chart_str,
+            "params": {
+                "rows": rows, "cols": cols,
+                "vol_rows": vol_rows,
+                "rsi_rows": rsi_rows, "rsi_window": rsi_window,
+                "obv_rows": obv_rows, "obv_window": obv_window,
+            },
+            "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            **(save_meta or {}),
+        }
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return chart_str
 
 
 # ══════════════════════════════════════════════════════════════════════════════

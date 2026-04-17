@@ -26,17 +26,20 @@
 ────
   TEST_RATIO   : 테스트셋 비율 (기본 0.2 = 20%)
   MAX_TEST     : 최대 테스트 샘플 수 (처리 시간 제한)
-  MODEL        : Ollama 모델명
+  MODEL        : Gemini 모델명
+  GEMINI_API_KEY : env var
 """
 
 import json
+import os
 import sys
 import logging
 import random
 from pathlib import Path
 from datetime import datetime
 
-import requests
+from google import genai
+from google.genai import types
 
 # ── 경로 ──────────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -47,9 +50,22 @@ OUT_PATH       = BASE_DIR / "llm_output" / "backtest_result.json"
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 TEST_RATIO  = 0.2     # 뒤 20%를 테스트셋으로
 MAX_TEST    = 100     # 테스트 샘플 최대 수 (시간 절약)
-OLLAMA_URL  = "http://localhost:11434/api/chat"
-MODEL       = "gemma3:27b"
-TIMEOUT     = 120
+MODEL       = "gemini-2.5-flash"
+
+_client: genai.Client | None = None
+
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "API 키 없음. 환경변수 GEMINI_API_KEY 를 설정하세요.\n"
+                "  export GEMINI_API_KEY=your_key_here"
+            )
+        _client = genai.Client(api_key=api_key)
+    return _client
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,18 +75,38 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Ollama 호출 ────────────────────────────────────────────────────────────────
+# ── Gemini 호출 ────────────────────────────────────────────────────────────────
 
-def call_ollama(messages: list[dict]) -> str:
-    payload = {
-        "model":    MODEL,
-        "messages": messages,
-        "stream":   False,
-        "options":  {"temperature": 0.1, "top_p": 0.9},
-    }
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()["message"]["content"].strip()
+def call_gemini(messages: list[dict], temperature: float = 0.1) -> str:
+    """Google GenAI chat API 호출 → 응답 텍스트 반환"""
+    client = _get_client()
+
+    system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+
+    contents = []
+    for m in messages:
+        if m["role"] == "user":
+            contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(text=m["content"])])
+            )
+        elif m["role"] == "assistant":
+            contents.append(
+                types.Content(role="model", parts=[types.Part.from_text(text=m["content"])])
+            )
+
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        top_p=0.9,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        **({"system_instruction": system_msg} if system_msg else {}),
+    )
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=contents,
+        config=config,
+    )
+    return response.text.strip()
 
 
 def extract_json(text: str) -> dict:
@@ -91,55 +127,59 @@ def extract_json(text: str) -> dict:
 # ── 예측 프롬프트 ──────────────────────────────────────────────────────────────
 
 SYSTEM_BASE = """당신은 한국 주식 차트 패턴 분석 전문가입니다.
-텍스트 차트를 읽고 다음 10 거래일 방향을 예측합니다.
+세 개의 동기화된 ASCII 서브차트를 읽고 다음 10 거래일 방향을 예측합니다.
 
-캔들 문자:
-  █ 양봉 / ░ 음봉 / ─ 도지 / │ 꼬리 / 0 빈칸
-  . MA20 / - MA60 / ^v 볼린저밴드
+차트 1 (가격 캔들):
+  █=양봉  ░=음봉  ─=도지  │=꼬리  0=빈칸
+  .=MA20  -=MA60  ^=BB상단  ·=BB중단  v=BB하단
 
-차트는 왼쪽이 과거, 오른쪽이 현재입니다."""
+차트 2 (RSI, 고정 0~100 스케일):
+  *=중립(30~70)  +=과매수(>70)  ==과매도(<30)
+  ─=30/70 기준선  :=50 중간선
+
+차트 3 (OBV 롤링, 정규화):
+  █=매수압력(+)  ░=매도압력(-)  ─=중립선
+
+왼쪽=과거, 오른쪽=현재."""
 
 
 def predict_prompt(pair: dict) -> str:
     """Y를 절대 포함하지 않는 순수 예측 프롬프트"""
     return f"""## 종목: {pair['name']} ({pair['ticker']})
-## 기간: {pair['x_start']} ~ {pair['x_end']}
+## 기간: {pair['x_start']} ~ {pair['x_end']} (2개월, 약 42거래일)
 
-### 텍스트 차트
+### 통합 ASCII 차트 (가격 │ 거래량 │ RSI │ OBV)
 {pair['x_chart']}
 
-### 메타데이터
-{pair['x_meta']}
-
 ---
-다음 10 거래일 방향을 예측하세요.
+위 세 개의 동기화된 차트를 읽고 다음 10 거래일 방향을 예측하세요.
+- 가격 차트: 캔들 패턴, MA 위치, 볼린저 밴드 상태
+- RSI 차트: * 점 위치 및 궤적, ^ / v 존재 여부
+- OBV 차트: █ / ░ 바 방향과 크기 추세
 
 [출력 형식 — JSON만]
 {{
   "predicted_direction": "UP 또는 DOWN 또는 FLAT",
   "confidence": "HIGH 또는 MEDIUM 또는 LOW",
-  "reason": "근거 1문장"
+  "reason": "차트에서 읽은 근거 1문장"
 }}"""
 
 
 def predict_with_rules_prompt(pair: dict, kb_content: str) -> str:
     """knowledge_base 룰을 컨텍스트로 제공한 예측 프롬프트"""
-    return f"""## 참고 룰 사전 (과거 케이스에서 추출된 조건 기반 룰)
-{kb_content[:3000]}  ← 토큰 제한으로 앞부분만 사용
+    return f"""## 참고 룰 사전 (과거 케이스에서 추출된 차트 기반 룰)
+{kb_content}
 
 ---
 ## 종목: {pair['name']} ({pair['ticker']})
-## 기간: {pair['x_start']} ~ {pair['x_end']}
+## 기간: {pair['x_start']} ~ {pair['x_end']} (2개월, 약 42거래일)
 
-### 텍스트 차트
+### 통합 ASCII 차트 (가격 │ 거래량 │ RSI │ OBV)
 {pair['x_chart']}
 
-### 메타데이터
-{pair['x_meta']}
-
 ---
-위 룰 사전을 참고하여 이 차트의 패턴을 파악하고 다음 10 거래일 방향을 예측하세요.
-어떤 룰을 적용했는지 명시하세요.
+위 룰 사전과 세 개의 동기화된 차트(가격/RSI/OBV)를 함께 읽고
+다음 10 거래일 방향을 예측하세요. 어떤 룰을 적용했는지 명시하세요.
 
 [출력 형식 — JSON만]
 {{
@@ -188,16 +228,19 @@ def summarize(results: list[dict], label: str) -> dict:
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
-def check_ollama() -> bool:
+def check_gemini() -> bool:
+    """Gemini API 연결 확인"""
     try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=5)
-        models = [m["name"] for m in resp.json().get("models", [])]
-        if not any(MODEL.split(":")[0] in m for m in models):
-            log.warning(f"'{MODEL}' 없음. `ollama pull {MODEL}` 실행하세요.")
-            return False
+        client = _get_client()
+        r = client.models.generate_content(
+            model=MODEL,
+            contents="hi",
+            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=4),
+        )
+        log.info(f"Gemini API 연결 성공 — 모델: {MODEL}")
         return True
     except Exception as e:
-        log.error(f"Ollama 연결 실패: {e}")
+        log.error(f"Gemini API 연결 실패: {e}")
         return False
 
 
@@ -241,7 +284,7 @@ def main():
         kb_content = KB_PATH.read_text(encoding="utf-8")
         log.info(f"knowledge_base 로드: {len(kb_content)}자")
 
-    if not check_ollama():
+    if not check_gemini():
         return
 
     # ── 예측 실행 ─────────────────────────────────────────────────────────────
@@ -255,7 +298,7 @@ def main():
 
         # ── A) 베이스라인 예측 (룰 없음) ───────────────────────────────────
         try:
-            raw_base = call_ollama([
+            raw_base = call_gemini([
                 {"role": "system", "content": SYSTEM_BASE},
                 {"role": "user",   "content": predict_prompt(sample)},
             ])
@@ -279,7 +322,7 @@ def main():
         # ── B) 룰 적용 예측 ───────────────────────────────────────────────
         if kb_content:
             try:
-                raw_ruled = call_ollama([
+                raw_ruled = call_gemini([
                     {"role": "system", "content": SYSTEM_BASE},
                     {"role": "user",   "content": predict_with_rules_prompt(sample, kb_content)},
                 ])
